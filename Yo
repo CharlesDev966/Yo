@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SYNTHESIS // Procedural Motion Reel</title>
+  <style>
+    :root {
+      --bg: #070709;
+      --panel: #111116;
+      --border: #23232e;
+      --text: #f4f4f6;
+      --muted: #8b8b9e;
+      --accent: #d4ff00;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      gap: 18px;
+    }
+
+    .stage-wrapper {
+      width: 100%;
+      max-width: 1080px;
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: 0 30px 90px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255,255,255,0.03);
+      position: relative;
+    }
+
+    canvas {
+      width: 100%;
+      height: auto;
+      aspect-ratio: 16 / 9;
+      display: block;
+      background: #09090c;
+    }
+
+    .controls {
+      width: 100%;
+      max-width: 1080px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 18px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+    }
+
+    button {
+      background: #1c1c24;
+      color: var(--text);
+      border: 1px solid #2e2e3b;
+      padding: 9px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    button:hover:not(:disabled) {
+      background: #272733;
+      border-color: #444457;
+    }
+
+    button.primary {
+      background: var(--accent);
+      color: #09090c;
+      border-color: var(--accent);
+    }
+
+    button.primary:hover:not(:disabled) {
+      filter: brightness(0.92);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .scrubber-wrap {
+      flex: 1;
+      min-width: 180px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .timecode {
+      font-family: 'SF Mono', 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      color: var(--muted);
+      min-width: 92px;
+      text-align: right;
+    }
+
+    .status {
+      font-size: 12px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="stage-wrapper">
+    <canvas id="stage" width="1920" height="1080"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="playBtn">Pause</button>
+    <button id="restartBtn">Restart</button>
+    <div class="scrubber-wrap">
+      <input id="scrubber" type="range" min="0" max="10.5" step="0.01" value="0" />
+      <span class="timecode" id="timecode">00.00 / 10.50s</span>
+    </div>
+    <button id="exportBtn" class="primary">Export Video (.webm)</button>
+    <span id="status" class="status">60 FPS • 1920×1080</span>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('stage');
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+    const DURATION = 10.5;
+
+    const playBtn = document.getElementById('playBtn');
+    const restartBtn = document.getElementById('restartBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const scrubber = document.getElementById('scrubber');
+    const timecodeEl = document.getElementById('timecode');
+    const statusEl = document.getElementById('status');
+
+    let t = 0;
+    let isPlaying = true;
+    let isExporting = false;
+    let lastTime = performance.now();
+    let mediaRecorder = null;
+    let recordedChunks = [];
+
+    // Palette
+    const C = {
+      bg: '#09090c',
+      surface: '#14141b',
+      ink: '#f5f5f7',
+      muted: '#6e6e82',
+      accent: '#d4ff00',
+      violet: '#7c5cff',
+      cyan: '#00e5ff'
+    };
+
+    // Math & Easing Helpers
+    const clamp = (v, min = 0, max = 1) => Math.max(min, Math.min(max, v));
+    const lerp = (a, b, p) => a + (b - a) * p;
+    const seg = (time, start, end) => clamp((time - start) / (end - start));
+
+    const easeOutExpo = x => x === 1 ? 1 : 1 - Math.pow(2, -10 * x);
+    const easeInExpo = x => x === 0 ? 0 : Math.pow(2, 10 * x - 10);
+    const easeInOutExpo = x => {
+      if (x === 0 || x === 1) return x;
+      return x < 0.5 ? Math.pow(2, 20 * x - 10) / 2 : (2 - Math.pow(2, -20 * x + 10)) / 2;
+    };
+    const easeOutCubic = x => 1 - Math.pow(1 - x, 3);
+    const easeOutBack = x => {
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+    };
+
+    // Typography Helper (cross-browser letter tracking)
+    function drawTrackedText(text, x, y, tracking = 0, align = 'center') {
+      const chars = text.split('');
+      const widths = chars.map(ch => ctx.measureText(ch).width);
+      const totalWidth = widths.reduce((a, b) => a + b, 0) + tracking * Math.max(0, chars.length - 1);
+
+      let cursorX = x;
+      if (align === 'center') cursorX = x - totalWidth / 2;
+      else if (align === 'right') cursorX = x - totalWidth;
+
+      ctx.textAlign = 'left';
+      for (let i = 0; i < chars.length; i++) {
+        ctx.fillText(chars[i], cursorX, y);
+        cursorX += widths[i] + tracking;
+      }
+    }
+
+    // Masked Text Reveal
+    function drawMaskedText(text, x, y, progress, font, color, tracking = 0, align = 'center', dir = 'up') {
+      ctx.save();
+      ctx.font = font;
+      const metrics = ctx.measureText(text);
+      const fontSize = parseInt(font.match(/(\d+)px/)[1], 10);
+      const boxH = fontSize * 1.35;
+      const boxW = metrics.width + Math.abs(tracking) * text.length + 120;
+      const boxX = align === 'center' ? x - boxW / 2 : align === 'right' ? x - boxW : x - 20;
+
+      ctx.beginPath();
+      ctx.rect(boxX, y - boxH * 0.78, boxW, boxH);
+      ctx.clip();
+
+      const offset = (1 - progress) * (dir === 'up' ? boxH : -boxH);
+      ctx.fillStyle = color;
+      ctx.textBaseline = 'middle';
+      drawTrackedText(text, x, y + offset, tracking, align);
+      ctx.restore();
+    }
+
+    // Rounded Rect Helper
+    function roundRectPath(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    // 3D Wireframe Octahedron / Prism for Scene 2
+    const prismVerts = [
+      [0, -1.35, 0], [1, 0, 0], [0, 0, 1], [-1, 0, 0], [0, 0, -1], [0, 1.35, 0]
+    ];
+    const prismEdges = [
+      [0,1],[0,2],[0,3],[0,4],
+      [5,1],[5,2],[5,3],[5,4],
+      [1,2],[2,3],[3,4],[4,1]
+    ];
+
+    function draw3DPrism(cx, cy, radius, rotY, rotX, color, lineWidth = 4) {
+      const projected = prismVerts.map(([vx, vy, vz]) => {
+        // Rotate Y
+        const x1 = vx * Math.cos(rotY) - vz * Math.sin(rotY);
+        const z1 = vx * Math.sin(rotY) + vz * Math.cos(rotY);
+        // Rotate X
+        const y2 = vy * Math.cos(rotX) - z1 * Math.sin(rotX);
+        const z2 = vy * Math.sin(rotX) + z1 * Math.cos(rotX);
+        const perspective = 3.2 / (3.2 - z2);
+        return [cx + x1 * radius * perspective, cy + y2 * radius * perspective];
+      });
+
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      for (const [a, b] of prismEdges) {
+        ctx.moveTo(projected[a][0], projected[a][1]);
+        ctx.lineTo(projected[b][0], projected[b][1]);
+      }
+      ctx.stroke();
+
+      // Vertex nodes
+      ctx.fillStyle = color;
+      for (const [px, py] of projected) {
+        ctx.beginPath();
+        ctx.arc(px, py, lineWidth * 1.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // Ambient Grid + Glow
+    function drawBackdropGrid(alpha = 0.14, color = '#ffffff', offset = 0) {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 1;
+      const step = 120;
+      for (let x = (offset % step); x < W; x += step) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+      }
+      for (let y = (offset % step); y < H; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // =====================================================
+    // SCENE 1 (0.0s -> 2.7s): CALIBRATION & KINETIC INTRO
+    // =====================================================
+    function drawScene1(time) {
+      ctx.save();
+      ctx.fillStyle = C.bg;
+      ctx.fillRect(0, 0, W, H);
+
+      // Radial ambient glow
+      const glow = ctx.createRadialGradient(W/2, H/2, 20, W/2, H/2, 720);
+      glow.addColorStop(0, 'rgba(124, 92, 255, 0.22)');
+      glow.addColorStop(1, 'rgba(9, 9, 12, 0)');
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, W, H);
+
+      const gridFade = easeOutExpo(seg(time, 0, 0.9));
+      drawBackdropGrid(0.08 * gridFade, '#ffffff', time * 18);
+
+      // Expanding precision rings
+      const r1 = easeOutExpo(seg(time, 0.05, 1.1)) * 340;
+      const r2 = easeOutExpo(seg(time, 0.18, 1.3)) * 460;
+
+      ctx.save();
+      ctx.translate(W/2, H/2);
+      ctx.rotate(time * 0.35);
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([12, 18]);
+      ctx.beginPath();
+      ctx.arc(0, 0, r1, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = C.accent;
+      ctx.globalAlpha = 0.55 * easeOutCubic(seg(time, 0.2, 0.7));
+      ctx.lineWidth = 3;
+      ctx.setLineDash([90, 210]);
+      ctx.beginPath();
+      ctx.arc(0, 0, r2, -Math.PI * 0.4, Math.PI * 1.4);
+      ctx.stroke();
+      ctx.restore();
+
+      // Center kinetic typography
+      const pBeyond = easeOutExpo(seg(time, 0.25, 1.05));
+      const pStatic = easeOutExpo(seg(time, 0.45, 1.25));
+      const pSlash  = easeInOutExpo(seg(time, 1.15, 1.7));
+      const zoomPush = 1 + easeInExpo(seg(time, 2.0, 2.7)) * 0.45;
+
+      ctx.save();
+      ctx.translate(W/2, H/2);
+      ctx.scale(zoomPush, zoomPush);
+      ctx.translate(-W/2, -H/2);
+
+      drawMaskedText('BEYOND', W/2, H/2 - 78, pBeyond, '800 132px Inter, sans-serif', C.ink, 18);
+      drawMaskedText('STATIC', W/2, H/2 + 78, pStatic, '800 132px Inter, sans-serif', '#525266', 18);
+
+      // Electric lime strike-through bar
+      if (pSlash > 0) {
+        const barW = 760 * pSlash;
+        ctx.fillStyle = C.accent;
+        ctx.fillRect(W/2 - barW / 2, H/2 + 72, barW, 14);
+      }
+
+      // Subtitle badge
+      const pSub = easeOutExpo(seg(time, 0.9, 1.5));
+      ctx.globalAlpha = pSub;
+      ctx.font = '600 22px "SF Mono", monospace';
+      ctx.fillStyle = C.accent;
+      drawTrackedText('SEQ 01 // PROCEDURAL ENGINE', W/2, H/2 - 205, 6);
+      ctx.restore();
+
+      ctx.restore();
+    }
+
+    // =====================================================
+    // SCENE 2 (2.2s -> 5.3s): HIGH-CONTRAST MOTION & 3D
+    // =====================================================
+    function drawScene2(time) {
+      // Wipe reveal mask from bottom-right/diagonal or horizontal split
+      const wipe = easeInOutExpo(seg(time, 2.2, 2.75));
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, H * (1 - wipe), W, H * wipe);
+      ctx.clip();
+
+      // Acid Lime Canvas Background
+      ctx.fillStyle = C.accent;
+      ctx.fillRect(0, 0, W, H);
+      drawBackdropGrid(0.12, '#09090c', -time * 40);
+
+      // Kinetic Background Marquee Rows
+      const slide1 = lerp(-240, 120, easeOutCubic(seg(time, 2.3, 5.2)));
+      const slide2 = lerp(240, -140, easeOutCubic(seg(time, 2.3, 5.2)));
+
+      ctx.save();
+      ctx.font = '900 210px Inter, sans-serif';
+      ctx.fillStyle = 'rgba(9, 9, 12, 0.08)';
+      ctx.textBaseline = 'middle';
+      drawTrackedText('MOTION  PRECISION', W/2 + slide1, H * 0.22, 12);
+      drawTrackedText('ENERGY  VELOCITY', W/2 + slide2, H * 0.78, 12);
+      ctx.restore();
+
+      // Central Dark Card
+      const cardPop = easeOutBack(seg(time, 2.55, 3.25));
+      const cardW = 1280 * cardPop;
+      const cardH = 580 * cardPop;
+
+      ctx.save();
+      roundRectPath(W/2 - cardW/2, H/2 - cardH/2, cardW, cardH, 32);
+      ctx.fillStyle = C.bg;
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      ctx.stroke();
+      ctx.clip();
+
+      // Inside card: Left Kinetic Words, Right 3D Rotating Wireframe
+      const wordStep = seg(time, 2.7, 5.0);
+      const p1 = easeOutExpo(seg(time, 2.75, 3.35));
+      const p2 = easeOutExpo(seg(time, 3.15, 3.75));
+      const p3 = easeOutExpo(seg(time, 3.55, 4.15));
+
+      drawMaskedText('BUILD', W/2 - 490, H/2 - 125, p1, '900 104px Inter, sans-serif', C.ink, 4, 'left');
+      drawMaskedText('FASTER', W/2 - 490, H/2, p2, '900 104px Inter, sans-serif', C.accent, 4, 'left');
+      drawMaskedText('STORIES.', W/2 - 490, H/2 + 125, p3, '900 104px Inter, sans-serif', C.violet, 4, 'left');
+
+      // 3D Prism on right side of card
+      const prismScale = easeOutBack(seg(time, 2.7, 3.4));
+      draw3DPrism(
+        W/2 + 310,
+        H/2,
+        165 * prismScale,
+        time * 1.9,
+        Math.sin(time * 1.4) * 0.65,
+        C.accent,
+        4.5
+      );
+
+      // Subtle Orbiting Label
+      ctx.font = '600 18px "SF Mono", monospace';
+      ctx.fillStyle = C.muted;
+      drawTrackedText('3D VECTOR PROJECTION // ACTIVE', W/2 + 310, H/2 + 235, 3);
+
+      ctx.restore(); // end card clip
+      ctx.restore(); // end wipe clip
+    }
+
+    // =====================================================
+    // SCENE 3 (4.9s -> 8.0s): TELEMETRY WAVEFORM & PILLS
+    // =====================================================
+    function drawScene3(time) {
+      const wipe = easeInOutExpo(seg(time, 4.9, 5.45));
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, W * wipe, H);
+      ctx.clip();
+
+      ctx.fillStyle = C.bg;
+      ctx.fillRect(0, 0, W, H);
+
+      // Dual ambient glows
+      const g1 = ctx.createRadialGradient(W*0.25, H*0.35, 10, W*0.25, H*0.35, 550);
+      g1.addColorStop(0, 'rgba(0, 229, 255, 0.16)');
+      g1.addColorStop(1, 'rgba(9, 9, 12, 0)');
+      ctx.fillStyle = g1;
+      ctx.fillRect(0, 0, W, H);
+
+      const g2 = ctx.createRadialGradient(W*0.75, H*0.65, 10, W*0.75, H*0.65, 550);
+      g2.addColorStop(0, 'rgba(212, 255, 0, 0.12)');
+      g2.addColorStop(1, 'rgba(9, 9, 12, 0)');
+      ctx.fillStyle = g2;
+      ctx.fillRect(0, 0, W, H);
+
+      drawBackdropGrid(0.06, '#ffffff', 0);
+
+      // Live Animated Multi-Layer Sine Waveform
+      const waveIn = easeOutExpo(seg(time, 5.15, 5.9));
+      const layers = [
+        { amp: 110, freq: 0.0055, speed: 4.5, color: C.cyan, alpha: 0.75, width: 4 },
+        { amp: 75,  freq: 0.0085, speed: -3.2, color: C.violet, alpha: 0.65, width: 3 },
+        { amp: 145, freq: 0.0038, speed: 2.8, color: C.accent, alpha: 0.9, width: 5 }
+      ];
+
+      layers.forEach(layer => {
+        ctx.save();
+        ctx.strokeStyle = layer.color;
+        ctx.globalAlpha = layer.alpha * waveIn;
+        ctx.lineWidth = layer.width;
+        ctx.beginPath();
+        for (let x = 140; x <= W - 140; x += 10) {
+          const normX = (x - 140) / (W - 280);
+          const envelope = Math.sin(normX * Math.PI); // taper ends cleanly
+          const y = H * 0.56 + Math.sin(x * layer.freq + time * layer.speed) * layer.amp * envelope * waveIn;
+          if (x === 140) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.restore();
+      });
+
+      // Big Dynamic Percentage Counter
+      const countProg = easeOutExpo(seg(time, 5.2, 6.8));
+      const pct = Math.round(countProg * 100);
+      ctx.save();
+      ctx.font = '900 160px Inter, sans-serif';
+      ctx.fillStyle = C.ink;
+      ctx.textBaseline = 'middle';
+      drawTrackedText(`${pct}%`, W/2, H * 0.30, 4);
+
+      ctx.font = '600 22px "SF Mono", monospace';
+      ctx.fillStyle = C.cyan;
+      ctx.globalAlpha = easeOutCubic(seg(time, 5.3, 5.8));
+      drawTrackedText('RENDER PIPELINE SYNCHRONIZED', W/2, H * 0.17, 6);
+      ctx.restore();
+
+      // Staggered Feature Pills
+      const pills = [
+        { label: 'KINETIC TYPE', color: C.accent, delay: 5.55 },
+        { label: 'BEZIER PHYSICS', color: C.cyan, delay: 5.75 },
+        { label: '60 FPS CANVAS', color: C.violet, delay: 5.95 }
+      ];
+
+      pills.forEach((pill, i) => {
+        const pop = easeOutBack(seg(time, pill.delay, pill.delay + 0.55));
+        if (pop <= 0) return;
+        const px = W/2 + (i - 1) * 340;
+        const py = H * 0.80;
+        const pw = 290 * pop;
+        const ph = 66 * pop;
+
+        ctx.save();
+        roundRectPath(px - pw/2, py - ph/2, pw, ph, 33);
+        ctx.fillStyle = '#15151f';
+        ctx.fill();
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = pill.color;
+        ctx.stroke();
+
+        ctx.globalAlpha = clamp((pop - 0.3) / 0.7);
+        ctx.font = '700 21px Inter, sans-serif';
+        ctx.fillStyle = C.ink;
+        ctx.textBaseline = 'middle';
+        drawTrackedText(pill.label, px, py + 1, 2);
+        ctx.restore();
+      });
+
+      ctx.restore();
+    }
+
+    // =====================================================
+    // SCENE 4 (7.6s -> 10.5s): HERO FINALE & BRAND LOCKUP
+    // =====================================================
+    function drawScene4(time) {
+      const reveal = easeInOutExpo(seg(time, 7.6, 8.15));
+      ctx.save();
+      // Circular Iris Wipe Reveal from Center
+      ctx.beginPath();
+      ctx.arc(W/2, H/2, reveal * 1250, 0, Math.PI * 2);
+      ctx.clip();
+
+      ctx.fillStyle = '#060608';
+      ctx.fillRect(0, 0, W, H);
+
+      const heroGlow = ctx.createRadialGradient(W/2, H/2 - 40, 20, W/2, H/2, 680);
+      heroGlow.addColorStop(0, 'rgba(212, 255, 0, 0.17)');
+      heroGlow.addColorStop(0.5, 'rgba(124, 92, 255, 0.08)');
+      heroGlow.addColorStop(1, 'rgba(6, 6, 8, 0)');
+      ctx.fillStyle = heroGlow;
+      ctx.fillRect(0, 0, W, H);
+
+      drawBackdropGrid(0.05, '#ffffff', 0);
+
+      // Interlocking Geometric Aperture Mark
+      const markPop = easeOutBack(seg(time, 7.85, 8.65));
+      const markSpin = lerp(-Math.PI * 0.75, 0, easeOutExpo(seg(time, 7.85, 8.9)));
+
+      ctx.save();
+      ctx.translate(W/2, H/2 - 145);
+      ctx.rotate(markSpin);
+      ctx.scale(markPop, markPop);
+
+      // Outer diamond
+      ctx.strokeStyle = C.accent;
+      ctx.lineWidth = 7;
+      ctx.beginPath();
+      ctx.moveTo(0, -78);
+      ctx.lineTo(78, 0);
+      ctx.lineTo(0, 78);
+      ctx.lineTo(-78, 0);
+      ctx.closePath();
+      ctx.stroke();
+
+      // Inner rotated square
+      ctx.strokeStyle = C.ink;
+      ctx.lineWidth = 5;
+      ctx.strokeRect(-38, -38, 76, 76);
+
+      // Core dot
+      ctx.fillStyle = C.accent;
+      ctx.beginPath();
+      ctx.arc(0, 0, 12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      // Condensing Hero Headline ("SYNTHESIS")
+      const titleProg = easeOutExpo(seg(time, 8.15, 9.25));
+      const tracking = lerp(65, 16, titleProg);
+
+      ctx.save();
+      ctx.globalAlpha = clamp(titleProg * 1.4);
+      ctx.font = '900 118px Inter, sans-serif';
+      ctx.fillStyle = C.ink;
+      ctx.textBaseline = 'middle';
+      drawTrackedText('SYNTHESIS', W/2, H/2 + 45, tracking);
+
+      // Glint light sweep across the headline
+      const glint = seg(time, 9.0, 9.7);
+      if (glint > 0 && glint < 1) {
+        const gx = lerp(W/2 - 520, W/2 + 520, glint);
+        const grad = ctx.createLinearGradient(gx - 90, 0, gx + 90, 0);
+        grad.addColorStop(0, 'rgba(212,255,0,0)');
+        grad.addColorStop(0.5, 'rgba(212,255,0,0.85)');
+        grad.addColorStop(1, 'rgba(212,255,0,0)');
+        ctx.fillStyle = grad;
+        ctx.globalCompositeOperation = 'source-atop';
+        ctx.fillRect(W/2 - 550, H/2 - 30, 1100, 150);
+      }
+      ctx.restore();
+
+      // Final Tagline
+      const tagProg = easeOutExpo(seg(time, 8.65, 9.45));
+      ctx.save();
+      ctx.globalAlpha = tagProg;
+      ctx.font = '500 26px "SF Mono", monospace';
+      ctx.fillStyle = C.muted;
+      ctx.textBaseline = 'middle';
+      drawTrackedText('DESIGN IN MOTION  •  BUILT IN REAL TIME', W/2, H/2 + 160, 5);
+      ctx.restore();
+
+      ctx.restore();
+    }
+
+    // =====================================================
+    // STUDIO CAMERA OVERLAY (HUD FRAME)
+    // =====================================================
+    function drawStudioHUD(time) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = 2;
+      const m = 44; // margin
+      const l = 28; // corner length
+
+      // 4 Viewfinder Corners
+      const corners = [
+        [m, m, 1, 1], [W - m, m, -1, 1],
+        [m, H - m, 1, -1], [W - m, H - m, -1, -1]
+      ];
+      for (const [cx, cy, dx, dy] of corners) {
+        ctx.beginPath();
+        ctx.moveTo(cx, cy + dy * l);
+        ctx.lineTo(cx, cy);
+        ctx.lineTo(cx + dx * l, cy);
+        ctx.stroke();
+      }
+
+      // Live Timecode & Recording Indicator
+      ctx.font = '600 18px "SF Mono", monospace';
+      ctx.textBaseline = 'middle';
+      const blink = Math.floor(time * 2) % 2 === 0;
+      ctx.fillStyle = blink ? '#ff3b5c' : 'rgba(255, 59, 92, 0.3)';
+      ctx.beginPath();
+      ctx.arc(m + 24, m + 28, 6, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = 'rgba(255,255,255,0.65)';
+      ctx.textAlign = 'left';
+      ctx.fillText(`REC  ${time.toFixed(2)}s / ${DURATION.toFixed(2)}s`, m + 42, m + 29);
+
+      ctx.textAlign = 'right';
+      ctx.fillText('1920×1080  //  60FPS', W - m - 20, m + 29);
+
+      // Bottom subtle progress hairline
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.fillRect(m, H - m - 8, W - m * 2, 3);
+      ctx.fillStyle = C.accent;
+      ctx.fillRect(m, H - m - 8, (W - m * 2) * (time / DURATION), 3);
+
+      ctx.restore();
+    }
+
+    // Master Render Function
+    function renderFrame(time) {
+      if (time < 2.75) drawScene1(time);
+      if (time >= 2.2 && time < 5.45) drawScene2(time);
+      if (time >= 4.9 && time < 8.15) drawScene3(time);
+      if (time >= 7.6) drawScene4(time);
+
+      drawStudioHUD(time);
+    }
+
+    // Animation Loop
+    function loop(now) {
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      if (isPlaying) {
+        t += dt;
+        if (t >= DURATION) {
+          if (isExporting) {
+            finishExport();
+            t = DURATION;
+            isPlaying = false;
+          } else {
+            t = 0; // loop seamlessly during preview
+          }
+        }
+        scrubber.value = t;
+      }
+
+      timecodeEl.textContent = `${t.toFixed(2).padStart(5, '0')} / ${DURATION.toFixed(2)}s`;
+      renderFrame(t);
+      requestAnimationFrame(loop);
+    }
+
+    // Controls
+    playBtn.addEventListener('click', () => {
+      if (isExporting) return;
+      isPlaying = !isPlaying;
+      playBtn.textContent = isPlaying ? 'Pause' : 'Play';
+    });
+
+    restartBtn.addEventListener('click', () => {
+      if (isExporting) return;
+      t = 0;
+      isPlaying = true;
+      playBtn.textContent = 'Pause';
+    });
+
+    scrubber.addEventListener('input', (e) => {
+      if (isExporting) return;
+      isPlaying = false;
+      playBtn.textContent = 'Play';
+      t = parseFloat(e.target.value);
+    });
+
+    // Built-in WebM Video Exporter
+    function finishExport() {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+      }
+    }
+
+    exportBtn.addEventListener('click', () => {
+      if (!canvas.captureStream || typeof MediaRecorder === 'undefined') {
+        statusEl.textContent = 'Export unsupported in this browser.';
+        return;
+      }
+
+      const mimeTypes = [
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm'
+      ];
+      const mimeType = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) || '';
+
+      try {
+        const stream = canvas.captureStream(60);
+        mediaRecorder = mimeType
+          ? new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 12_000_000 })
+          : new MediaRecorder(stream);
+
+        recordedChunks = [];
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = () => {
+          const blob = new Blob(recordedChunks, { type: mimeType || 'video/webm' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'synthesis-motion-reel.webm';
+          a.click();
+          URL.revokeObjectURL(url);
+
+          isExporting = false;
+          exportBtn.disabled = false;
+          playBtn.disabled = false;
+          restartBtn.disabled = false;
+          exportBtn.textContent = 'Export Video (.webm)';
+          statusEl.textContent = 'Export complete!';
+          setTimeout(() => { statusEl.textContent = '60 FPS • 1920×1080'; }, 3000);
+        };
+
+        // Reset to start and record full sequence
+        isExporting = true;
+        t = 0;
+        isPlaying = true;
+        exportBtn.disabled = true;
+        playBtn.disabled = true;
+        restartBtn.disabled = true;
+        exportBtn.textContent = 'Recording (10.5s)...';
+        statusEl.textContent = 'Capturing 1080p stream...';
+
+        mediaRecorder.start();
+      } catch (err) {
+        statusEl.textContent = 'Export error: ' + err.message;
+        isExporting = false;
+      }
+    });
+
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
